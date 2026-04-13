@@ -27,16 +27,31 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   read -rp "  Azure DevOps org URL (e.g. https://dev.azure.com/myorg): " _ORG
   read -rp "  Project name: " _PROJECT
   read -rp "  Your ADO email: " _EMAIL
-  read -rp "  Default area path (e.g. MyProject\\Team): " _AREA
+  echo ""
+  echo "  How many team area paths do you want to configure?"
+  read -rp "  Number of teams [1]: " _TEAM_COUNT
+  _TEAM_COUNT="${_TEAM_COUNT:-1}"
+  _AREA_OPTIONS=""
+  _DEFAULT_AREA=""
+  for i in $(seq 1 "$_TEAM_COUNT"); do
+    read -rp "  Team $i label (e.g. 'Client XP'): " _LABEL
+    read -rp "  Team $i full area path (e.g. 'Project\\Team'): " _PATH
+    if [[ $i -eq 1 ]]; then
+      _DEFAULT_AREA="$_PATH"
+      _AREA_OPTIONS="${_LABEL}:${_PATH}"
+    else
+      _AREA_OPTIONS="${_AREA_OPTIONS}\n${_LABEL}:${_PATH}"
+    fi
+  done
   cat > "$CONFIG_FILE" <<CONF
-ADO_ORG=${_ORG}
-ADO_PROJECT=${_PROJECT}
-ADO_EMAIL=${_EMAIL}
-ADO_DEFAULT_AREA=${_AREA}
+ADO_ORG="${_ORG}"
+ADO_PROJECT="${_PROJECT}"
+ADO_EMAIL="${_EMAIL}"
+ADO_DEFAULT_AREA="${_DEFAULT_AREA}"
+ADO_AREA_OPTIONS="${_AREA_OPTIONS}"
 CONF
   echo ""
   echo "  ✅ Config saved to $CONFIG_FILE"
-  echo "  You can edit it anytime or add ADO_AREA_OPTIONS for multi-team prompts."
   echo ""
 fi
 
