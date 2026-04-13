@@ -81,7 +81,11 @@ _spin() {
 }
 
 spin_start() { _spin "${1:-}" & SPIN_PID=$!; }
-spin_stop()  { kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null; printf "\r\033[K"; }
+spin_stop()  {
+  kill "$SPIN_PID" 2>/dev/null || true
+  wait "$SPIN_PID" 2>/dev/null || true
+  printf "\r\033[K"
+}
 
 _query_wiql() {
   local wiql="$1"
