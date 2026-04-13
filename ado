@@ -314,6 +314,7 @@ if desc:
     ;;
 
   current)
+    spin_start "Finding current sprint..."
     CURRENT=$(az boards query \
       --wiql "SELECT [System.IterationPath] FROM WorkItems
         WHERE [System.AssignedTo] = @Me
@@ -330,6 +331,7 @@ paths = {i['fields']['System.IterationPath'] for i in items if i['fields'].get('
 relevant = [p for p in paths if re.search(r'\d{4}', p)]
 print(sorted(relevant, key=sort_key)[-1] if relevant else '')
 ")
+    spin_stop
     [[ -z "$CURRENT" ]] && echo "No active sprint found." && exit 0
     echo "⚡  Current sprint: $CURRENT"
     _query_wiql "SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.AssignedTo]
@@ -337,7 +339,7 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
       WHERE [System.TeamProject] = '$PROJECT'
         AND [System.IterationPath] = '$CURRENT'
         AND [System.State] NOT IN ('Closed', 'Done', 'Cancelled', 'Removed')
-      ORDER BY [System.AssignedTo] ASC, [System.State] ASC"
+      ORDER BY [System.AssignedTo] ASC, [System.State] ASC" "Fetching sprint tickets..."
     ;;
 
   assign)
