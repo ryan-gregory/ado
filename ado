@@ -67,11 +67,30 @@ AREA_OPTIONS="${ADO_AREA_OPTIONS:-}"
 export ADO_ORG="$ORG"
 export ADO_PROJECT="$PROJECT"
 
+# ── spinner ────────────────────────────────────────────────────────────────
+
+_spin() {
+  local msg="${1:-Working...}"
+  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+  local i=0
+  while true; do
+    printf "\r  \033[36m%s\033[0m  %s" "${frames[$((i % 10))]}" "$msg"
+    sleep 0.08
+    i=$((i+1))
+  done
+}
+
+spin_start() { _spin "${1:-}" & SPIN_PID=$!; }
+spin_stop()  { kill "$SPIN_PID" 2>/dev/null; wait "$SPIN_PID" 2>/dev/null; printf "\r\033[K"; }
+
 _query_wiql() {
-  az boards query \
-    --wiql "$1" \
-    --org "$ORG" \
-    -o table 2>&1
+  local wiql="$1"
+  local msg="${2:-Fetching tickets...}"
+  spin_start "$msg"
+  local result
+  result=$(az boards query --wiql "$wiql" --org "$ORG" -o table 2>&1)
+  spin_stop
+  echo "$result"
 }
 
 cmd="${1:-help}"
@@ -80,14 +99,17 @@ shift || true
 case "$cmd" in
   mine)
     echo "🎫  My open tickets:"
-    az boards query \
+    spin_start "Fetching your tickets..."
+    MINE_RESULT=$(az boards query \
       --wiql "SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.IterationPath]
         FROM WorkItems
         WHERE [System.AssignedTo] = @Me
           AND [System.TeamProject] = '$PROJECT'
           AND [System.State] NOT IN ('Closed', 'Done', 'Cancelled', 'Removed')
         ORDER BY [System.IterationPath] DESC, [System.State] ASC" \
-      --org "$ORG" -o json 2>&1 | python3 -c "
+      --org "$ORG" -o json 2>&1)
+    spin_stop
+    echo "$MINE_RESULT" | python3 -c "
 import sys, json
 items = json.load(sys.stdin)
 grouped = {}
@@ -254,7 +276,8 @@ for p in upcoming:
   show)
     ID="${1:?Usage: ado show <id>}"
     echo "🔍  Ticket #$ID:"
-    az boards work-item show \
+    spin_start "Loading ticket..."
+    SHOW_RESULT=$(az boards work-item show \
       --id "$ID" \
       --org "$ORG" \
       --query "{
@@ -267,7 +290,9 @@ for p in upcoming:
         tags: fields.\"System.Tags\",
         description: fields.\"System.Description\"
       }" \
-      -o json | python3 -c "
+      -o json 2>&1)
+    spin_stop
+    echo "$SHOW_RESULT" | python3 -c "
 import sys, json, re, os
 d = json.load(sys.stdin)
 print(f\"  ID:          {d['id']}\")
@@ -314,41 +339,39 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
   assign)
     ID="${1:?Usage: ado assign <id>}"
     echo "🙋  Assigning #$ID to you..."
+    spin_start "Updating..."
     az boards work-item update \
-      --id "$ID" \
-      --assigned-to "$ADO_EMAIL" \
-      --org "$ORG" \
+      --id "$ID" --assigned-to "$ADO_EMAIL" --org "$ORG" \
       --query "{id:id,assignedTo:fields.\"System.AssignedTo\",title:fields.\"System.Title\"}" \
-      -o table
+      -o table 2>&1 | { spin_stop; cat; }
     ;;
 
   unassign)
     ID="${1:?Usage: ado unassign <id>}"
     echo "🚫  Unassigning #$ID..."
+    spin_start "Updating..."
     az boards work-item update \
-      --id "$ID" \
-      --assigned-to "" \
-      --org "$ORG" \
+      --id "$ID" --assigned-to "" --org "$ORG" \
       --query "{id:id,assignedTo:fields.\"System.AssignedTo\",title:fields.\"System.Title\"}" \
-      -o table
+      -o table 2>&1 | { spin_stop; cat; }
     ;;
 
   state)
     ID="${1:?Usage: ado state <id> <state>}"
     STATE="${2:?Usage: ado state <id> <state>}"
     echo "✏️   Updating #$ID → '$STATE'..."
+    spin_start "Updating..."
     az boards work-item update \
-      --id "$ID" \
-      --state "$STATE" \
-      --org "$ORG" \
+      --id "$ID" --state "$STATE" --org "$ORG" \
       --query "{id:id,state:fields.\"System.State\",title:fields.\"System.Title\"}" \
-      -o table
+      -o table 2>&1 | { spin_stop; cat; }
     ;;
 
   comment)
     ID="${1:?Usage: ado comment <id> <text>}"
     TEXT="${2:?Usage: ado comment <id> <text>}"
     echo "💬  Adding comment to #$ID..."
+    spin_start "Posting comment..."
     az boards work-item update \
       --id "$ID" \
       --discussion "$TEXT" \
@@ -509,10 +532,12 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     [[ -n "$DESCRIPTION" ]] && CREATE_ARGS+=(--description "$DESCRIPTION")
 
     set +e
+    spin_start "Creating work item..."
     RESULT=$(az boards work-item create "${CREATE_ARGS[@]}" \
       --query "{id:id,type:fields.\"System.WorkItemType\",state:fields.\"System.State\",title:fields.\"System.Title\",assignedTo:fields.\"System.AssignedTo\".displayName,iteration:fields.\"System.IterationPath\"}" \
       -o json 2>&1)
     EXIT_CODE=$?
+    spin_stop
     set -e
 
     if [[ $EXIT_CODE -ne 0 ]]; then
@@ -524,7 +549,9 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     # Set area path (not supported in create, must update after)
     CREATED_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null)
     if [[ -n "$CREATED_ID" && -n "$AREA_PATH" ]]; then
+      spin_start "Setting area path..."
       az boards work-item update --id "$CREATED_ID" --area "$AREA_PATH" --org "$ORG" -o none 2>/dev/null || true
+      spin_stop
     fi
 
     echo "$RESULT" | python3 -c "
