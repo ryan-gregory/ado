@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# ADO CLI - Azure DevOps work item helper for OTR/Clutch
-# Org: https://dev.azure.com/otrcapital  Project: OTR
+# ado — Azure DevOps CLI work item helper
 # Requires: az cli with azure-devops extension, logged in via `az login`
+#
+# Config: ~/.config/ado/config (auto-created on first run)
 #
 # Usage:
 #   ado mine                        List my open tickets
-#   ado sprint [iteration]          List my tickets in a sprint (prompts if no arg given)
+#   ado sprint [iteration]          List my tickets in a sprint
 #   ado show <id>                   Show ticket details
 #   ado state <id> <state>          Update ticket state
 #   ado comment <id> <text>         Add a discussion comment
@@ -14,8 +15,42 @@
 
 set -euo pipefail
 
-ORG="https://dev.azure.com/otrcapital"
-PROJECT="OTR"
+# ── config ─────────────────────────────────────────────────────────────────
+
+CONFIG_DIR="$HOME/.config/ado"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  mkdir -p "$CONFIG_DIR"
+  echo "  ⚙️  First run — let's configure ado."
+  echo ""
+  read -rp "  Azure DevOps org URL (e.g. https://dev.azure.com/myorg): " _ORG
+  read -rp "  Project name: " _PROJECT
+  read -rp "  Your ADO email: " _EMAIL
+  read -rp "  Default area path (e.g. MyProject\\Team): " _AREA
+  cat > "$CONFIG_FILE" <<CONF
+ADO_ORG=${_ORG}
+ADO_PROJECT=${_PROJECT}
+ADO_EMAIL=${_EMAIL}
+ADO_DEFAULT_AREA=${_AREA}
+CONF
+  echo ""
+  echo "  ✅ Config saved to $CONFIG_FILE"
+  echo "  You can edit it anytime or add ADO_AREA_OPTIONS for multi-team prompts."
+  echo ""
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+ORG="${ADO_ORG}"
+PROJECT="${ADO_PROJECT}"
+ADO_EMAIL="${ADO_EMAIL}"
+DEFAULT_AREA="${ADO_DEFAULT_AREA:-}"
+AREA_OPTIONS="${ADO_AREA_OPTIONS:-}"
+
+export ADO_ORG="$ORG"
+export ADO_PROJECT="$PROJECT"
 
 _query_wiql() {
   az boards query \
@@ -218,7 +253,7 @@ for p in upcoming:
         description: fields.\"System.Description\"
       }" \
       -o json | python3 -c "
-import sys, json, re
+import sys, json, re, os
 d = json.load(sys.stdin)
 print(f\"  ID:          {d['id']}\")
 print(f\"  Type:        {d['type']}\")
@@ -227,7 +262,7 @@ print(f\"  Assigned To: {d['assignedTo']}\")
 print(f\"  Iteration:   {d['iteration']}\")
 print(f\"  Tags:        {d.get('tags') or 'none'}\")
 print(f\"  Title:       {d['title']}\")
-print(f\"  URL:         https://dev.azure.com/otrcapital/OTR/_workitems/edit/{d['id']}\")
+print(f\"  URL:         {os.environ.get('ADO_ORG','')}/{os.environ.get('ADO_PROJECT','')}/_workitems/edit/{d['id']}\")
 desc = re.sub(r'<[^>]+>', '', d.get('description') or '').strip()
 if desc:
     print(f\"\nDescription:\n{desc[:800]}\")
@@ -266,7 +301,7 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     echo "🙋  Assigning #$ID to you..."
     az boards work-item update \
       --id "$ID" \
-      --assigned-to "Ryan.Gregory@otrsolutions.com" \
+      --assigned-to "$ADO_EMAIL" \
       --org "$ORG" \
       --query "{id:id,assignedTo:fields.\"System.AssignedTo\",title:fields.\"System.Title\"}" \
       -o table
@@ -309,7 +344,7 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
 
   open)
     ID="${1:?Usage: ado open <id>}"
-    URL="https://dev.azure.com/otrcapital/OTR/_workitems/edit/$ID"
+    URL="$ORG/$PROJECT/_workitems/edit/$ID"
     echo "🌐  Opening $URL"
     open "$URL"
     ;;
@@ -416,16 +451,24 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
 
     # Area path
     echo ""
-    echo "  Area path:"
-    echo "    1) Banking\\Clutch\\Client XP Team (default)"
-    echo "    2) Banking\\OTR Mobile App"
-    echo ""
-    read -rp "  Select area [1]: " AREA_CHOICE
-    AREA_CHOICE="${AREA_CHOICE:-1}"
-    case "$AREA_CHOICE" in
-      2) AREA_PATH="OTR\\Banking\\OTR Mobile App" ;;
-      *) AREA_PATH="OTR\\Banking\\Clutch\\Client XP Team" ;;
-    esac
+    if [[ -n "$AREA_OPTIONS" ]]; then
+      echo "  Area path:"
+      i=1
+      while IFS= read -r opt; do
+        LABEL=$(echo "$opt" | cut -d: -f1)
+        [[ $i -eq 1 ]] && echo "    $i) $LABEL (default)" || echo "    $i) $LABEL"
+        i=$((i+1))
+      done <<< "$(echo -e "$AREA_OPTIONS")"
+      echo ""
+      read -rp "  Select area [1]: " AREA_CHOICE
+      AREA_CHOICE="${AREA_CHOICE:-1}"
+      AREA_PATH=$(echo -e "$AREA_OPTIONS" | sed -n "${AREA_CHOICE}p" | cut -d: -f2-)
+      [[ -z "$AREA_PATH" ]] && AREA_PATH=$(echo -e "$AREA_OPTIONS" | head -1 | cut -d: -f2-)
+    elif [[ -n "$DEFAULT_AREA" ]]; then
+      AREA_PATH="$DEFAULT_AREA"
+    else
+      AREA_PATH=""
+    fi
 
     # Description — open $EDITOR in a temp file
     echo ""
@@ -447,7 +490,7 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     )
     [[ -n "$ITERATION" ]] && CREATE_ARGS+=(--iteration "$ITERATION")
     ASSIGN_UPPER=$(echo "$ASSIGN_SELF" | tr '[:lower:]' '[:upper:]')
-    [[ "$ASSIGN_UPPER" == "Y" || "$ASSIGN_UPPER" == "YES" ]] && CREATE_ARGS+=(--assigned-to "Ryan.Gregory@otrsolutions.com")
+    [[ "$ASSIGN_UPPER" == "Y" || "$ASSIGN_UPPER" == "YES" ]] && CREATE_ARGS+=(--assigned-to "$ADO_EMAIL")
     [[ -n "$DESCRIPTION" ]] && CREATE_ARGS+=(--description "$DESCRIPTION")
 
     set +e
@@ -479,7 +522,7 @@ try:
     print(f'     Assigned:  {d.get(\"assignedTo\") or \"Unassigned\"}')
     print(f'     Iteration: {d.get(\"iteration\") or \"None\"}')
     print(f'     Title:     {d[\"title\"]}')
-    print(f'     URL:       https://dev.azure.com/otrcapital/OTR/_workitems/edit/{d[\"id\"]}')
+    print(f'     URL:       {ORG}/{PROJECT}/_workitems/edit/{d[\"id\"]}')
 except Exception as e:
     print('Raw response:')
     print(sys.stdin.read() if False else open('/dev/stdin').read() if False else '')
