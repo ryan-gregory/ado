@@ -69,10 +69,13 @@ export ADO_PROJECT="$PROJECT"
 
 # ── spinner ────────────────────────────────────────────────────────────────
 
+SPIN_PID=""
+
 _spin() {
   local msg="${1:-Working...}"
   local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   local i=0
+  trap 'printf "\r\033[K\033[?25h"; exit 0' INT TERM
   while true; do
     printf "\r  \033[36m%s\033[0m  %s" "${frames[$((i % 10))]}" "$msg"
     sleep 0.08
@@ -80,12 +83,25 @@ _spin() {
   done
 }
 
-spin_start() { _spin "${1:-}" & SPIN_PID=$!; }
-spin_stop()  {
-  kill "$SPIN_PID" 2>/dev/null || true
-  wait "$SPIN_PID" 2>/dev/null || true
-  printf "\r\033[K"
+spin_start() {
+  printf "\033[?25l"
+  _spin "${1:-}" &
+  SPIN_PID=$!
 }
+spin_stop()  {
+  if [[ -n "$SPIN_PID" ]]; then
+    kill "$SPIN_PID" 2>/dev/null || true
+    wait "$SPIN_PID" 2>/dev/null || true
+    SPIN_PID=""
+  fi
+  printf "\r\033[K\033[?25h"
+}
+
+_spin_cleanup() {
+  spin_stop
+  exit 130
+}
+trap _spin_cleanup INT TERM
 
 _query_wiql() {
   local wiql="$1"
@@ -220,8 +236,8 @@ def sort_key(p):
     nums = [int(n) for n in re.findall(r'\d+', p)]
     return nums if nums else [-1]
 sep = '\\\\'
-prefix = 'OTR' + sep + 'Iteration' + sep
-paths = [c['path'].lstrip(sep).replace(prefix, 'OTR' + sep) for c in children]
+prefix = '$PROJECT' + sep + 'Iteration' + sep
+paths = [c['path'].lstrip(sep).replace(prefix, '$PROJECT' + sep) for c in children]
 for p in sorted(paths, key=sort_key):
     print(p)
 ")
@@ -365,12 +381,122 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
   state)
     ID="${1:?Usage: ado state <id> <state>}"
     STATE="${2:?Usage: ado state <id> <state>}"
-    echo "✏️   Updating #$ID → '$STATE'..."
-    spin_start "Updating..."
-    az boards work-item update \
-      --id "$ID" --state "$STATE" --org "$ORG" \
-      --query "{id:id,state:fields.\"System.State\",title:fields.\"System.Title\"}" \
-      -o table 2>&1 | { spin_stop; cat; }
+    spin_start "Looking up work item type..."
+    TYPE=$(az boards work-item show --id "$ID" --org "$ORG" \
+      --query 'fields."System.WorkItemType"' -o tsv 2>/dev/null || true)
+    if [[ -z "$TYPE" ]]; then
+      spin_stop
+      echo "❌  Could not fetch work item #$ID"
+      exit 1
+    fi
+    STATES_JSON=$(az devops invoke --org "$ORG" \
+      --area wit --resource workitemtypestates \
+      --route-parameters project="$PROJECT" type="$TYPE" \
+      --api-version 7.1-preview -o json 2>/dev/null || true)
+    spin_stop
+    VALID_STATES=$(printf '%s' "$STATES_JSON" | python3 -c \
+      'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print("\n".join(s["name"] for s in d.get("value",[])))
+except Exception:
+    pass')
+    if [[ -z "$VALID_STATES" ]]; then
+      echo "❌  Could not fetch valid states for work item type '$TYPE'"
+      exit 1
+    fi
+    MATCHED=$(printf '%s\n' "$VALID_STATES" | awk -v s="$STATE" 'tolower($0)==tolower(s){print; exit}')
+    if [[ -z "$MATCHED" ]]; then
+      echo "❌  Invalid state '$STATE' for work item type '$TYPE'."
+      echo "    Supported states:"
+      printf '%s\n' "$VALID_STATES" | sed 's/^/      - /'
+      exit 1
+    fi
+    echo "✏️   Updating #$ID ($TYPE) → '$MATCHED'..."
+
+    # Wrapper that runs the update; on rule-error for required fields,
+    # dynamically fetch the reference name + allowed values, prompt, and retry.
+    EXTRA_FIELDS=()
+    ATTEMPT=0
+    while :; do
+      ATTEMPT=$((ATTEMPT+1))
+      spin_start "Updating..."
+      set +e
+      UPDATE_OUT=$(az boards work-item update \
+        --id "$ID" --state "$MATCHED" --org "$ORG" \
+        ${EXTRA_FIELDS[@]:+--fields "${EXTRA_FIELDS[@]}"} \
+        --query "{id:id,state:fields.\"System.State\",title:fields.\"System.Title\"}" \
+        -o table 2>&1)
+      EXIT_CODE=$?
+      set -e
+      spin_stop
+
+      if [[ $EXIT_CODE -eq 0 ]]; then
+        echo "$UPDATE_OUT"
+        break
+      fi
+
+      MISSING_FIELD=$(printf '%s\n' "$UPDATE_OUT" | sed -nE 's/.*Rule Error for field ([^.]+)\..*/\1/p' | head -1)
+      if [[ -z "$MISSING_FIELD" || $ATTEMPT -gt 5 ]]; then
+        echo "❌  Update failed:"
+        echo "$UPDATE_OUT"
+        exit $EXIT_CODE
+      fi
+
+      echo ""
+      echo "⚠️   Transition requires field: $MISSING_FIELD"
+      spin_start "Looking up field metadata..."
+      FIELD_TMP=$(mktemp)
+      az devops invoke --org "$ORG" \
+        --area wit --resource workitemtypesfield \
+        --route-parameters project="$PROJECT" type="$TYPE" \
+        --query-parameters '$expand=allowedValues' \
+        --api-version 7.1 -o json > "$FIELD_TMP" 2>/dev/null || true
+      spin_stop
+
+      FIELD_INFO=$(FIELD_FILE="$FIELD_TMP" MISSING="$MISSING_FIELD" python3 -c "
+import os, json, sys
+try:
+    d = json.load(open(os.environ['FIELD_FILE']))
+except Exception:
+    sys.exit(0)
+target = os.environ['MISSING'].strip().lower()
+for f in d.get('value', []):
+    if f.get('name','').strip().lower() == target:
+        print(f.get('referenceName',''))
+        for v in f.get('allowedValues',[]) or []:
+            print(v)
+        break
+")
+      rm -f "$FIELD_TMP"
+
+      REF_NAME=$(printf '%s\n' "$FIELD_INFO" | head -1)
+      mapfile -t ALLOWED < <(printf '%s\n' "$FIELD_INFO" | tail -n +2)
+
+      if [[ -z "$REF_NAME" ]]; then
+        echo "❌  Could not resolve reference name for field '$MISSING_FIELD'."
+        echo "$UPDATE_OUT"
+        exit 1
+      fi
+
+      if [[ ${#ALLOWED[@]} -gt 0 ]]; then
+        echo "    Allowed values:"
+        for i in "${!ALLOWED[@]}"; do
+          echo "      $((i+1))) ${ALLOWED[$i]}"
+        done
+        read -rp "    Select [1-${#ALLOWED[@]}] or type a value: " CHOICE
+        if [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#ALLOWED[@]} )); then
+          VALUE="${ALLOWED[$((CHOICE-1))]}"
+        else
+          VALUE="$CHOICE"
+        fi
+      else
+        read -rp "    Value for '$MISSING_FIELD': " VALUE
+      fi
+      [[ -z "$VALUE" ]] && { echo "❌  No value provided."; exit 1; }
+
+      EXTRA_FIELDS+=("${REF_NAME}=${VALUE}")
+    done
     ;;
 
   comment)
@@ -393,6 +519,47 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     open "$URL"
     ;;
 
+  desc|description)
+    ID="${1:?Usage: ado desc <id>}"
+    spin_start "Fetching current description..."
+    CURRENT=$(az boards work-item show --id "$ID" --org "$ORG" \
+      --query 'fields."System.Description"' -o tsv 2>/dev/null || echo "")
+    spin_stop
+
+    TMPFILE=$(mktemp /tmp/ado-desc-${ID}.XXXXXX.html)
+    {
+      echo "<!-- Editing description for #${ID}. ADO accepts HTML. -->"
+      echo "<!-- Lines starting with <!-- are stripped before submit. -->"
+      echo "<!-- Save empty (after comments) to abort. -->"
+      echo ""
+      echo "$CURRENT"
+    } > "$TMPFILE"
+    ${EDITOR:-nvim} "$TMPFILE"
+    NEW_DESC=$(grep -v '^<!--' "$TMPFILE" | sed '/^[[:space:]]*$/d' | head -c 50000 || true)
+    rm -f "$TMPFILE"
+
+    if [[ -z "$NEW_DESC" ]]; then
+      echo "⚠️   Empty description — aborted."
+      exit 0
+    fi
+
+    spin_start "Updating description..."
+    set +e
+    RESULT=$(az boards work-item update --id "$ID" --org "$ORG" \
+      --description "$NEW_DESC" -o none 2>&1)
+    EXIT_CODE=$?
+    set -e
+    spin_stop
+
+    if [[ $EXIT_CODE -ne 0 ]]; then
+      echo "❌  Failed to update description:"
+      echo "$RESULT"
+      exit $EXIT_CODE
+    fi
+    echo "  ✅  Updated description on #${ID}"
+    echo "     URL: $ORG/$PROJECT/_workitems/edit/${ID}"
+    ;;
+
   create)
     echo "✨  Create a new work item"
     echo ""
@@ -404,19 +571,55 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     fi
     [[ -z "$TITLE" ]] && echo "Title is required." && exit 1
 
-    # Type
+    # Type — enumerate enabled, non-hidden work item types from the project
     echo ""
+    spin_start "Loading work item types..."
+    TYPES_TMP=$(mktemp); CATS_TMP=$(mktemp)
+    az devops invoke \
+      --area wit --resource workitemtypes \
+      --route-parameters project="$PROJECT" \
+      --org "$ORG" --http-method GET --api-version 7.1 -o json > "$TYPES_TMP" 2>/dev/null
+    az devops invoke \
+      --area wit --resource workitemtypecategories \
+      --route-parameters project="$PROJECT" \
+      --org "$ORG" --http-method GET --api-version 7.1 -o json > "$CATS_TMP" 2>/dev/null
+    spin_stop
+
+    mapfile -t TYPES < <(TYPES_FILE="$TYPES_TMP" CATS_FILE="$CATS_TMP" python3 -c "
+import os, sys, json
+try:
+    types = json.load(open(os.environ['TYPES_FILE'])).get('value', [])
+    cats  = json.load(open(os.environ['CATS_FILE'])).get('value', [])
+except Exception:
+    sys.exit(0)
+hidden = set()
+for c in cats:
+    if c.get('referenceName') == 'Microsoft.HiddenCategory':
+        for t in c.get('workItemTypes', []):
+            hidden.add(t.get('name'))
+names = [t['name'] for t in types if not t.get('isDisabled', False) and t['name'] not in hidden]
+names.sort(key=str.lower)
+for n in names:
+    print(n)
+" 2>/dev/null)
+    rm -f "$TYPES_TMP" "$CATS_TMP"
+
+    if [[ ${#TYPES[@]} -eq 0 ]]; then
+      echo "❌  Could not enumerate work item types for project '$PROJECT'."
+      exit 1
+    fi
+
+    DEFAULT_TYPE="${TYPES[0]}"
     echo "  Work item type:"
-    TYPES=("User Story" "Task" "Bug" "Feature" "Epic")
     for i in "${!TYPES[@]}"; do
       echo "    $((i+1))) ${TYPES[$i]}"
     done
-    read -rp "  Select [1-${#TYPES[@]}] (default: 1 User Story): " TYPE_CHOICE
+    read -rp "  Select [1-${#TYPES[@]}] (default: 1 $DEFAULT_TYPE): " TYPE_CHOICE
     TYPE_CHOICE="${TYPE_CHOICE:-1}"
     if [[ "$TYPE_CHOICE" =~ ^[0-9]+$ ]] && (( TYPE_CHOICE >= 1 && TYPE_CHOICE <= ${#TYPES[@]} )); then
       WORK_ITEM_TYPE="${TYPES[$((TYPE_CHOICE-1))]}"
     else
-      WORK_ITEM_TYPE="User Story"
+      WORK_ITEM_TYPE="$DEFAULT_TYPE"
     fi
 
     # Sprint / iteration — my sprints + next 2 upcoming, merged and sorted
@@ -437,8 +640,8 @@ def sort_key(p):
     nums = [int(n) for n in re.findall(r'\d+', p)]
     return nums if nums else [-1]
 sep = '\\\\'
-prefix = 'OTR' + sep + 'Iteration' + sep
-paths = [c['path'].lstrip(sep).replace(prefix, 'OTR' + sep) for c in children]
+prefix = '$PROJECT' + sep + 'Iteration' + sep
+paths = [c['path'].lstrip(sep).replace(prefix, '$PROJECT' + sep) for c in children]
 for p in sorted(paths, key=sort_key):
     print(p)
 ")
@@ -560,22 +763,25 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
       spin_stop
     fi
 
-    echo "$RESULT" | python3 -c "
-import sys, json
+    ADO_ORG_URL="$ORG" ADO_PROJECT_NAME="$PROJECT" python3 -c "
+import os, sys, json, urllib.parse
+org = os.environ['ADO_ORG_URL'].rstrip('/')
+project = urllib.parse.quote(os.environ['ADO_PROJECT_NAME'])
+raw = sys.stdin.read()
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(raw)
     print(f'  ✅  Created #{d[\"id\"]}')
     print(f'     Type:      {d[\"type\"]}')
     print(f'     State:     {d[\"state\"]}')
     print(f'     Assigned:  {d.get(\"assignedTo\") or \"Unassigned\"}')
     print(f'     Iteration: {d.get(\"iteration\") or \"None\"}')
     print(f'     Title:     {d[\"title\"]}')
-    print(f'     URL:       {ORG}/{PROJECT}/_workitems/edit/{d[\"id\"]}')
-except Exception as e:
+    print(f'     URL:       {org}/{project}/_workitems/edit/{d[\"id\"]}')
+except Exception:
     print('Raw response:')
-    print(sys.stdin.read() if False else open('/dev/stdin').read() if False else '')
+    print(raw)
     raise
-" || echo "$RESULT"
+" <<< "$RESULT" || echo "$RESULT"
     ;;
 
   help|--help|-h|*)
@@ -590,10 +796,10 @@ Commands:
   ado show <id>                Show ticket details
   ado assign <id>              Assign a ticket to yourself
   ado unassign <id>            Remove assignment from a ticket
-  ado state <id> <state>       Update ticket state
-                               States: New, Active, Accepted, In Development, Done, Closed
+  ado state <id> <state>       Update ticket state (states fetched from Azure)
   ado comment <id> <text>      Add a discussion comment
   ado open <id>                Open ticket in browser
+  ado desc <id>                Edit description in $EDITOR (prefilled with current)
   ado create ["title"]         Create a new work item (interactive)
 EOF
     ;;

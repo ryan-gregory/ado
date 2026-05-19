@@ -2,27 +2,47 @@
 
 A minimal CLI for Azure DevOps work items. Wraps the `az boards` commands you actually use day-to-day into fast, readable interactions.
 
-## Requirements
+Works for any Azure DevOps org/project — configured per-user on first run.
 
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) with the `azure-devops` extension
-- Logged in via `az login`
+## Prerequisites
+
+- macOS or Linux with `bash`, `python3`, `jq`
+- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli) (`brew install azure-cli`)
+- `azure-devops` extension for Azure CLI
+- A logged-in Azure session
 
 ```bash
+brew install azure-cli jq
 az extension add --name azure-devops
 az login
 ```
 
-## Installation
+## Install
 
 ```bash
-git clone <repo>
-echo 'export PATH="$HOME/projects/ado:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+git clone https://github.com/ryan-gregory/ado.git ~/projects/ado
+~/projects/ado/bin/install.sh
+```
+
+The install script symlinks `ado` into `~/.local/bin/`. Re-run after `git pull` is unnecessary — the symlink stays valid.
+
+If `~/.local/bin` isn't on your PATH, the installer will tell you and give you the line to add.
+
+## Quick start
+
+First invocation prompts for org URL, project, email, and team area path(s), then writes `~/.config/ado/config`.
+
+```bash
+ado mine                    # tickets assigned to me, open
+ado current                 # all team tickets in my latest sprint
+ado show 12345              # full detail on a work item
+ado state 12345 Active      # transition state
+ado open 12345              # open in browser
 ```
 
 ## Configuration
 
-On first run, `ado` will prompt you to create `~/.config/ado/config`:
+Stored at `~/.config/ado/config`:
 
 ```bash
 ADO_ORG=https://dev.azure.com/yourorg
@@ -31,14 +51,13 @@ ADO_EMAIL=you@yourcompany.com
 ADO_DEFAULT_AREA=YourProject\YourTeam
 ```
 
-**Optional:** Add multiple area options for the `create` prompt:
+Optional — multiple area-path options for the `create` prompt:
 
 ```bash
-# Format: "Label:Full\Area\Path" — one per line, newline-separated
 ADO_AREA_OPTIONS="Team A:Project\Team A\nTeam B:Project\Team B"
 ```
 
-## Usage
+## Commands
 
 ```
 ado mine                     List my open tickets
@@ -57,3 +76,7 @@ ado create ["title"]         Create a new work item (interactive)
 ### States
 
 `New` · `Active` · `Accepted` · `In Development` · `Done` · `Closed`
+
+## License
+
+MIT — see `LICENSE`.
