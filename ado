@@ -519,6 +519,33 @@ for f in d.get('value', []):
     open "$URL"
     ;;
 
+  delete|rm)
+    ID="${1:?Usage: ado delete <id>}"
+    spin_start "Fetching ticket info..."
+    TITLE=$(az boards work-item show --id "$ID" --org "$ORG" \
+      --query 'fields."System.Title"' -o tsv 2>/dev/null || echo "(unknown)")
+    spin_stop
+    echo "⚠️   About to delete #$ID: $TITLE"
+    read -rp "  Are you sure? [y/N]: " CONFIRM
+    CONFIRM_UPPER=$(echo "$CONFIRM" | tr '[:lower:]' '[:upper:]')
+    if [[ "$CONFIRM_UPPER" != "Y" && "$CONFIRM_UPPER" != "YES" ]]; then
+      echo "  Aborted."
+      exit 0
+    fi
+    spin_start "Deleting..."
+    set +e
+    DEL_RESULT=$(az boards work-item delete --id "$ID" --project "$PROJECT" --org "$ORG" --yes -o json 2>&1)
+    DEL_EXIT=$?
+    set -e
+    spin_stop
+    if [[ $DEL_EXIT -ne 0 ]]; then
+      echo "❌  Failed to delete #$ID:"
+      echo "$DEL_RESULT"
+      exit $DEL_EXIT
+    fi
+    echo "  🗑️  Deleted #$ID: $TITLE"
+    ;;
+
   desc|description)
     ID="${1:?Usage: ado desc <id>}"
     spin_start "Fetching current description..."
@@ -800,6 +827,7 @@ Commands:
   ado comment <id> <text>      Add a discussion comment
   ado open <id>                Open ticket in browser
   ado desc <id>                Edit description in $EDITOR (prefilled with current)
+  ado delete <id>              Delete a work item (with confirmation)
   ado create ["title"]         Create a new work item (interactive)
 EOF
     ;;
