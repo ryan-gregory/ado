@@ -67,12 +67,23 @@ ado sprint [iteration]       List my tickets in a sprint
 ado show <id>                Show ticket details
 ado assign <id>              Assign a ticket to yourself
 ado unassign <id>            Remove assignment
-ado state <id> <state>       Update ticket state
+ado state <id> [state]       Update ticket state (interactive picker if no state given)
+ado edit <id>                Edit title, assignment, and iteration interactively
 ado comment <id> <text>      Add a comment
 ado open <id>                Open ticket in browser
 ado desc <id>                Edit description in $EDITOR
 ado delete <id>              Delete a work item (with confirmation)
 ado create ["title"]         Create a new work item (interactive)
+```
+
+### Global flags
+
+Flags go before the command:
+
+```
+ado --quiet mine             Suppress spinners and emoji
+ado --json show 12345        Emit raw JSON (for scripting)
+ado -q state 12345 Active    Silent mode, just do it
 ```
 
 ### States

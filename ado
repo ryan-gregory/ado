@@ -113,6 +113,29 @@ _query_wiql() {
   echo "$result"
 }
 
+# ── output mode ────────────────────────────────────────────────────────────
+
+ADO_OUTPUT="pretty"
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --quiet|-q) ADO_OUTPUT="quiet"; shift ;;
+    --json|-j)  ADO_OUTPUT="json"; shift ;;
+    *) break ;;
+  esac
+done
+
+_emit() {
+  # Pretty-mode: print as-is. Quiet: suppress. Json: caller handles.
+  [[ "$ADO_OUTPUT" == "quiet" ]] && return 0
+  echo "$@"
+}
+
+if [[ "$ADO_OUTPUT" != "pretty" ]]; then
+  # Override spinner to no-op in non-pretty modes
+  spin_start() { :; }
+  spin_stop()  { :; }
+fi
+
 cmd="${1:-help}"
 shift || true
 
@@ -379,11 +402,14 @@ print(sorted(relevant, key=sort_key)[-1] if relevant else '')
     ;;
 
   state)
-    ID="${1:?Usage: ado state <id> <state>}"
-    STATE="${2:?Usage: ado state <id> <state>}"
+    ID="${1:?Usage: ado state <id> [state]}"
+    STATE="${2:-}"
     spin_start "Looking up work item type..."
-    TYPE=$(az boards work-item show --id "$ID" --org "$ORG" \
-      --query 'fields."System.WorkItemType"' -o tsv 2>/dev/null || true)
+    ITEM_JSON=$(az boards work-item show --id "$ID" --org "$ORG" \
+      --query "{type:fields.\"System.WorkItemType\",state:fields.\"System.State\"}" \
+      -o json 2>/dev/null || true)
+    TYPE=$(echo "$ITEM_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))" 2>/dev/null)
+    CURRENT_STATE=$(echo "$ITEM_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state',''))" 2>/dev/null)
     if [[ -z "$TYPE" ]]; then
       spin_stop
       echo "❌  Could not fetch work item #$ID"
@@ -404,6 +430,28 @@ except Exception:
     if [[ -z "$VALID_STATES" ]]; then
       echo "❌  Could not fetch valid states for work item type '$TYPE'"
       exit 1
+    fi
+    # Interactive picker when no state arg given
+    if [[ -z "$STATE" ]]; then
+      echo "⚙️   #$ID ($TYPE) — current state: $CURRENT_STATE"
+      echo "    Available states:"
+      i=1
+      while IFS= read -r s; do
+        if [[ "$s" == "$CURRENT_STATE" ]]; then
+          echo "      $i) $s ◀ current"
+        else
+          echo "      $i) $s"
+        fi
+        i=$((i+1))
+      done <<< "$VALID_STATES"
+      echo ""
+      read -rp "  Select state [#]: " STATE_CHOICE
+      if [[ "$STATE_CHOICE" =~ ^[0-9]+$ ]]; then
+        STATE=$(printf '%s\n' "$VALID_STATES" | sed -n "${STATE_CHOICE}p")
+      else
+        STATE="$STATE_CHOICE"
+      fi
+      [[ -z "$STATE" ]] && echo "  Aborted." && exit 0
     fi
     MATCHED=$(printf '%s\n' "$VALID_STATES" | awk -v s="$STATE" 'tolower($0)==tolower(s){print; exit}')
     if [[ -z "$MATCHED" ]]; then
@@ -517,6 +565,110 @@ for f in d.get('value', []):
     URL="$ORG/$PROJECT/_workitems/edit/$ID"
     echo "🌐  Opening $URL"
     open "$URL"
+    ;;
+
+  edit)
+    ID="${1:?Usage: ado edit <id>}"
+    spin_start "Fetching work item..."
+    EDIT_JSON=$(az boards work-item show --id "$ID" --org "$ORG" \
+      --query "{
+        title: fields.\"System.Title\",
+        state: fields.\"System.State\",
+        type: fields.\"System.WorkItemType\",
+        assignedTo: fields.\"System.AssignedTo\".uniqueName,
+        assignedToName: fields.\"System.AssignedTo\".displayName,
+        iteration: fields.\"System.IterationPath\"
+      }" -o json 2>&1)
+    spin_stop
+
+    EDIT_TITLE=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('title',''))")
+    EDIT_STATE=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state',''))")
+    EDIT_TYPE=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('type',''))")
+    EDIT_ASSIGNED=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('assignedTo') or '')")
+    EDIT_ASSIGNED_NAME=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('assignedToName') or 'Unassigned')")
+    EDIT_ITERATION=$(echo "$EDIT_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('iteration',''))")
+
+    echo "✏️   Editing #$ID ($EDIT_TYPE)"
+    echo "    Current: $EDIT_TITLE"
+    echo "    State:   $EDIT_STATE | Assigned: $EDIT_ASSIGNED_NAME | Sprint: $EDIT_ITERATION"
+    echo ""
+
+    # Title
+    read -rp "  Title [$EDIT_TITLE]: " NEW_TITLE
+    NEW_TITLE="${NEW_TITLE:-$EDIT_TITLE}"
+
+    # Assigned to
+    echo "  Assigned to: $EDIT_ASSIGNED_NAME ($EDIT_ASSIGNED)"
+    echo "    1) Keep current"
+    echo "    2) Assign to me ($ADO_EMAIL)"
+    echo "    3) Unassign"
+    echo "    4) Other (enter email)"
+    read -rp "  Select [1]: " ASSIGN_CHOICE
+    ASSIGN_CHOICE="${ASSIGN_CHOICE:-1}"
+    case "$ASSIGN_CHOICE" in
+      1) NEW_ASSIGNED="" ;;
+      2) NEW_ASSIGNED="$ADO_EMAIL" ;;
+      3) NEW_ASSIGNED="" ; UNASSIGN=true ;;
+      4) read -rp "    Email: " NEW_ASSIGNED ;;
+      *) NEW_ASSIGNED="" ;;
+    esac
+    UNASSIGN="${UNASSIGN:-false}"
+
+    # Iteration
+    read -rp "  Iteration [$EDIT_ITERATION]: " NEW_ITERATION
+    NEW_ITERATION="${NEW_ITERATION:-$EDIT_ITERATION}"
+
+    # Build update args
+    UPDATE_ARGS=(--id "$ID" --org "$ORG")
+    CHANGES=0
+    if [[ "$NEW_TITLE" != "$EDIT_TITLE" ]]; then
+      UPDATE_ARGS+=(--title "$NEW_TITLE")
+      CHANGES=$((CHANGES+1))
+    fi
+    if [[ -n "$NEW_ASSIGNED" ]]; then
+      UPDATE_ARGS+=(--assigned-to "$NEW_ASSIGNED")
+      CHANGES=$((CHANGES+1))
+    elif [[ "$UNASSIGN" == "true" ]]; then
+      UPDATE_ARGS+=(--assigned-to "")
+      CHANGES=$((CHANGES+1))
+    fi
+    if [[ "$NEW_ITERATION" != "$EDIT_ITERATION" ]]; then
+      UPDATE_ARGS+=(--iteration "$NEW_ITERATION")
+      CHANGES=$((CHANGES+1))
+    fi
+
+    if [[ $CHANGES -eq 0 ]]; then
+      echo "  No changes."
+      exit 0
+    fi
+
+    spin_start "Updating..."
+    set +e
+    EDIT_RESULT=$(az boards work-item update "${UPDATE_ARGS[@]}" \
+      --query "{id:id,title:fields.\"System.Title\",assignedTo:fields.\"System.AssignedTo\".displayName,iteration:fields.\"System.IterationPath\"}" \
+      -o json 2>&1)
+    EDIT_EXIT=$?
+    set -e
+    spin_stop
+
+    if [[ $EDIT_EXIT -ne 0 ]]; then
+      echo "❌  Update failed:"
+      echo "$EDIT_RESULT"
+      exit $EDIT_EXIT
+    fi
+
+    if [[ "$ADO_OUTPUT" == "json" ]]; then
+      echo "$EDIT_RESULT"
+    else
+      echo "$EDIT_RESULT" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(f'  ✅  Updated #{d[\"id\"]}')
+print(f'     Title:     {d[\"title\"]}')
+print(f'     Assigned:  {d.get(\"assignedTo\") or \"Unassigned\"}')
+print(f'     Iteration: {d.get(\"iteration\") or \"None\"}')
+"
+    fi
     ;;
 
   delete|rm)
@@ -815,6 +967,10 @@ except Exception:
     cat <<EOF
 ADO CLI — Azure DevOps work item helper
 
+Global flags (must come before the command):
+  --quiet, -q              Suppress spinners and decorative output
+  --json, -j               Suppress spinners, emit raw JSON where supported
+
 Commands:
   ado mine                     List my open tickets
   ado current                  Show all team tickets in my latest sprint
@@ -823,7 +979,8 @@ Commands:
   ado show <id>                Show ticket details
   ado assign <id>              Assign a ticket to yourself
   ado unassign <id>            Remove assignment from a ticket
-  ado state <id> <state>       Update ticket state (states fetched from Azure)
+  ado state <id> [state]       Update ticket state (interactive picker if no state given)
+  ado edit <id>                Edit title, assignment, and iteration interactively
   ado comment <id> <text>      Add a discussion comment
   ado open <id>                Open ticket in browser
   ado desc <id>                Edit description in $EDITOR (prefilled with current)
