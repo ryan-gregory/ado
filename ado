@@ -63,6 +63,7 @@ PROJECT="${ADO_PROJECT}"
 ADO_EMAIL="${ADO_EMAIL}"
 DEFAULT_AREA="${ADO_DEFAULT_AREA:-}"
 AREA_OPTIONS="${ADO_AREA_OPTIONS:-}"
+TEAM="${ADO_TEAM:-Client XP Team}"
 
 export ADO_ORG="$ORG"
 export ADO_PROJECT="$PROJECT"
@@ -602,14 +603,50 @@ for f in d.get('value', []):
     echo "    1) Keep current"
     echo "    2) Assign to me ($ADO_EMAIL)"
     echo "    3) Unassign"
-    echo "    4) Other (enter email)"
+    echo "    4) Pick from team"
+    echo "    5) Other (enter email)"
     read -rp "  Select [1]: " ASSIGN_CHOICE
     ASSIGN_CHOICE="${ASSIGN_CHOICE:-1}"
     case "$ASSIGN_CHOICE" in
       1) NEW_ASSIGNED="" ;;
       2) NEW_ASSIGNED="$ADO_EMAIL" ;;
       3) NEW_ASSIGNED="" ; UNASSIGN=true ;;
-      4) read -rp "    Email: " NEW_ASSIGNED ;;
+      4)
+        spin_start "Fetching team members..."
+        MEMBERS_JSON=$(az devops team list-member \
+          --team "$TEAM" --project "$PROJECT" --org "$ORG" \
+          --top 50 -o json 2>/dev/null || echo "[]")
+        spin_stop
+        mapfile -t MEMBER_EMAILS < <(echo "$MEMBERS_JSON" | python3 -c "
+import sys, json
+members = json.load(sys.stdin)
+for m in sorted(members, key=lambda x: x.get('identity',{}).get('displayName','')):
+    print(m.get('identity',{}).get('uniqueName',''))
+")
+        mapfile -t MEMBER_NAMES < <(echo "$MEMBERS_JSON" | python3 -c "
+import sys, json
+members = json.load(sys.stdin)
+for m in sorted(members, key=lambda x: x.get('identity',{}).get('displayName','')):
+    print(m.get('identity',{}).get('displayName',''))
+")
+        if [[ ${#MEMBER_EMAILS[@]} -eq 0 ]]; then
+          echo "    ⚠️  Could not fetch team members."
+          read -rp "    Email: " NEW_ASSIGNED
+        else
+          echo "    Team members:"
+          for i in "${!MEMBER_NAMES[@]}"; do
+            echo "      $((i+1))) ${MEMBER_NAMES[$i]} (${MEMBER_EMAILS[$i]})"
+          done
+          echo ""
+          read -rp "    Select [#]: " MEMBER_CHOICE
+          if [[ "$MEMBER_CHOICE" =~ ^[0-9]+$ ]] && (( MEMBER_CHOICE >= 1 && MEMBER_CHOICE <= ${#MEMBER_EMAILS[@]} )); then
+            NEW_ASSIGNED="${MEMBER_EMAILS[$((MEMBER_CHOICE-1))]}"
+          else
+            NEW_ASSIGNED="$MEMBER_CHOICE"
+          fi
+        fi
+        ;;
+      5) read -rp "    Email: " NEW_ASSIGNED ;;
       *) NEW_ASSIGNED="" ;;
     esac
     UNASSIGN="${UNASSIGN:-false}"
