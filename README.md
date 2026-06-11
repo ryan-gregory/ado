@@ -70,6 +70,8 @@ ado unassign <id>            Remove assignment
 ado state <id> <state>       Update ticket state
 ado comment <id> <text>      Add a comment
 ado open <id>                Open ticket in browser
+ado desc <id>                Edit description in $EDITOR
+ado delete <id>              Delete a work item (with confirmation)
 ado create ["title"]         Create a new work item (interactive)
 ```
 
