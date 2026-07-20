@@ -1,6 +1,6 @@
 # ado
 
-A minimal CLI for Azure DevOps work items. Wraps the `az boards` commands you actually use day-to-day into fast, readable interactions.
+A CLI for Azure DevOps work items. Wraps the `az boards` commands you actually use day-to-day into fast, readable interactions.
 
 Works for any Azure DevOps org/project — configured per-user on first run.
 
